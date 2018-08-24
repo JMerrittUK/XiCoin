@@ -6,12 +6,11 @@ using System.Collections.Generic;
 using System.Text;
 using System.Security.Cryptography;
 using System.Net.Sockets;
-using System.Net;
-using System.Runtime.Serialization.Formatters.Binary;
-using System.Net.WebSockets;
 using System.Threading;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using System.Xml.Serialization;
 
 /// <summary>
 /// WELCOME TO Ξ (XI) COIN!
@@ -44,12 +43,13 @@ namespace XiCoin
         // A larger nonce offset between threads means more ground for each one to cover, but also increases the chances of you getting a good nonce.
         const int nonceOffset = 100000;
         /// <summary>  </summary>
-        const int targetThreadCount = 1;
+        const int targetThreadCount = 8;
 
         #endregion
 
         static Session xiSession = new Session();
 
+        [STAThread]
         static void Main(string[] args)
         {
             // We create a new session. We're now ready to start using the currency!
@@ -62,10 +62,9 @@ namespace XiCoin
 
             Task.Run(() => xiSession.StartUpdate(1, globalCancellation));
 
-            xiSession.StartMining(targetThreadCount, xiSession);           
+            // Don't want to mine using default algorithm? Replace with your version here!
+            xiSession.miner.StartMining(targetThreadCount, xiSession);           
         }
-
-        
     }
 
     /// <summary>
@@ -74,36 +73,43 @@ namespace XiCoin
     /// This allows people to build off the top of the code base to write their own algorithms and UI setups - we don't want to hamstring people into our ugly UI!
     /// (this also makes it super easy for XiCoin to be included in existing wallets, they just need to communicate with a Session)
     /// </summary>
-    class Session
+    public class Session
     {
         /// <summary> How long it should take to create a block in seconds </summary>
-        const int BLOCK_GENERATION_INTERVAL = 10;
+        const int BLOCK_GENERATION_INTERVAL = 300;
         /// <summary> How many blocks after which the difficulty should adjust </summary>
         const int DIFFICULTY_ADJUSTMENT_INTERVAL = 5;
 
+        /// <summary> All blocks should be loaded into memory here </summary>
+        public ConcurrentDictionary<long, Block> blockchain = new ConcurrentDictionary<long, Block>();
+        /// <summary>  </summary>
+        public List<Peer> knownPeers = new List<Peer>();
+
+        /// <summary> The default mining class, you can write custom algorithms by creating a new class and changing the reference - that easy! </summary>
+        public XiMiner miner = new XiMiner();
 
         /// <summary> A local server, which will let us receive information from other peers </summary>
         TcpListener tcpServer = new TcpListener(5001);
 
-        /// <summary> All blocks should be loaded into memory here </summary>
-        public List<Block> blockchain;
-        List<Peer> knownPeers = new List<Peer>();
+        /// <summary>  </summary>
+        string executePath;
 
-        // This is ALWAYS the first block, and will be the same no matter what. This prevents the injection of fake content.
+        ///<summary> This is ALWAYS the first block, and will be the same no matter what. This prevents the injection of fake content. </summary> 
         Block genesisBlock = new Block()
         {
             blockNumber = 0,
             timestamp = 1533624300,
-            difficulty = 1,
+            difficulty = 3,
             nonce = 990330,
+            previousBlockHash = "",
             transactions = new List<Transaction>(),
             wallets = new List<Wallet>()
         };
 
         public void Start()
         {
-            // Calculate the original blockhash
-            genesisBlock.previousBlockHash = "This is an old block hash. Doesn't matter much except it's the beginning point!";
+            // We get the local path of the executable so we can access stored data
+            executePath = Environment.CurrentDirectory;
 
             // Add blank wallets / transactions for now. This will be a default wallet in the future.
             genesisBlock.transactions.Add(new Transaction());
@@ -111,11 +117,13 @@ namespace XiCoin
 
             genesisBlock.blockHash = Validation.CalculateBlockHash(genesisBlock);
 
+            //if (LoadData())
+            //    Console.WriteLine("Loaded data successfully.");
+            //else
+                blockchain.TryAdd(genesisBlock.blockNumber, genesisBlock);
+
             // Start listening for incoming requests!
             tcpServer.Start();
-
-            // Here we can add a selection of new peers. These are hardcoded IP's which should always be up - if not this can be edited, or extras can be added by file in peers.xi (SHA256 encrypted secured by nonce)
-            knownPeers.Add(new Peer() { ipAddress = "127.0.0.1" });
 
             // Now we need to make some external requests, to find out which of our known peers has the latest block.
             foreach (Peer peer in knownPeers)
@@ -128,12 +136,98 @@ namespace XiCoin
             // WE HIGHLY RECOMMEND YOU SPECIFY A MANUAL KNOWN WORKING IP! 
             // This will help avoid you starting a whole new blockchain which will just get
             // deleted the moment you come into contact with the much bigger main blockchain.
-            blockchain = new List<Block>
-            {
-                genesisBlock
-            };
+
+            // Now we set up any mining or wallets we need to
+            miner.xiSession = this;
         }
 
+        /// <summary>
+        /// 
+        /// </summary>
+        public bool LoadData()
+        {
+            // Get all of the peers
+            if (File.Exists(executePath + "/data/peers.xi"))
+            {
+                using (var peerStream = new StreamReader(executePath + "/data/peers.xi"))
+                {
+                    string peerIP;
+
+                    while (!string.IsNullOrEmpty(peerIP = peerStream.ReadLine()))
+                    {
+                        knownPeers.Add(new Peer() { ipAddress = peerIP });
+                        Console.WriteLine("Loaded peer " + peerIP);
+                    }
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            if (File.Exists(executePath + "/data/blocks.xi"))
+            {
+                // Load in the blocks
+                using (FileStream blockStream = File.OpenRead(executePath + "/data/blocks.xi"))
+                {
+                    XmlSerializer serializer = new XmlSerializer(typeof(List<Block>));
+
+                    List<Block> deserializedList = (List<Block>)serializer.Deserialize(blockStream);
+
+                    // Now we've got the blocks in, we need to go through each and put them into the blockchain correctly.
+                    foreach (Block block in deserializedList)
+                    {
+                        if (blockchain.TryAdd(block.blockNumber, block))
+                        {
+                            Console.WriteLine("Loaded block " + block.blockNumber);
+                        }
+                        else
+                        {
+                            Console.WriteLine("Failed to add block to the chain. Press enter to quit.");
+                            Console.ReadLine();
+
+                            Environment.Exit(0);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        public void SaveData()
+        {
+            // Save 
+            using (StreamWriter peerStream = new StreamWriter(executePath + "/data/peers.xi"))
+            {
+                foreach (Peer peer in knownPeers)
+                {
+                    peerStream.WriteLine(peer.ipAddress);
+                }
+            }            
+
+            // Save the blocks into an XML blocks.xi file
+            using (FileStream stream = File.OpenWrite(executePath + "/data/blocks.xi"))
+            {
+                XmlSerializer serializer = new XmlSerializer(typeof(List<Block>));
+
+                serializer.Serialize(stream, blockchain.Values.ToList());
+            }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="interval"></param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
         public async Task StartUpdate(int interval, CancellationToken cancellationToken)
         {
             while (true)
@@ -185,90 +279,25 @@ namespace XiCoin
             client.Close();
         }
 
-        #region Mining
-            List<Thread> miningThreads = new List<Thread>();
-
-            public void StartMining(int requestedThreads, Session xiSession)
-            {
-                for (int i = 0; i < requestedThreads; i++)
-                {                   
-                    // We start a new thread
-                    ThreadStart threadRef = new ThreadStart(MinerThread);
-                    Thread newThread = new Thread(threadRef);
-
-                    newThread.Start();
-
-                    miningThreads.Add(newThread);
-                }
-            }
-
-            bool blockFound;
-
-            void MinerThread()
-            {
-                // Got to do this to avoid a StackOverflowException :p
-                Random r = new Random();
-
-                while (AttemptMine(r.Next(0, 100000)))
-                {
-
-                }
-            }
-
-            public bool AttemptMine(int nonce)
-            {
-                blockFound = AttemptToFindBlock(nonce);
-
-                if (blockFound)
-                    nonce = 0;
-
-                nonce++;
-
-                return true;
-            }
-
-            bool AttemptToFindBlock(int attemptedNonce)
-            {
-                Block lastBlock = blockchain[blockchain.Count - 1];
-
-                Block newBlock = new Block()
-                {
-                    blockNumber = lastBlock.blockNumber + 1,
-                    previousBlockHash = lastBlock.blockHash,
-                    timestamp = Utility.UTCEpocTime(),
-                    difficulty = Validation.GetDifficulty(blockchain),
-                    nonce = attemptedNonce
-                };
-
-                newBlock.blockHash = Validation.CalculateBlockHash(newBlock);
-
-                if ( Validation.DoesHashMatchDifficulty(newBlock.blockHash.ToString(), newBlock.difficulty) && Validation.ValidateBlockIntegrity(newBlock, lastBlock) )
-                {
-                    Console.WriteLine("Found a block. Block Number: " + newBlock.blockNumber + " Nonce: " + attemptedNonce + " Difficulty: " + newBlock.difficulty);
-                    Broadcast.BroadcastNewBlock(blockchain, knownPeers, newBlock);
-
-                    return true;
-                }else
-                {
-                    //Console.WriteLine("Nonce " + attemptedNonce + " failed at difficulty " + newBlock.difficulty);
-                    return false;
-                }                                
-            }
-        #endregion
-
-
-        static class Broadcast
+        public static class Broadcast
         {
             /// <summary>
             /// 
             /// </summary>
             /// <param name="blockchain"></param>
             /// <param name="peerList"></param>
-            public static void BroadcastNewBlock(List<Block> blockchain, List<Peer> peerList, Block newBlock)
+            public static bool BroadcastNewBlock(ConcurrentDictionary<long, Block> blockchain, List<Peer> peerList, Block newBlock)
             {
                 Block lastBlock = blockchain[blockchain.Count - 1];
 
-                blockchain.Add(newBlock);
+                // We must validate the old block one more time before we progress. This is to prevent duplicates.
+                if(Validation.ValidateBlockIntegrity(newBlock, lastBlock))
+                {
+                    if(blockchain.TryAdd(newBlock.blockNumber, newBlock))
+                        return true;
+                }
+
+                return false;
             }
 
             static Block FindLatestBlock()
@@ -279,8 +308,10 @@ namespace XiCoin
             }
         }
 
-        static class Validation
+        public static class Validation
         {
+            const bool debug = false;
+
             /// <summary>
             /// 
             /// </summary>
@@ -292,20 +323,26 @@ namespace XiCoin
                 // We check to see if the block number is correct (i.e. matches our latest block plus one, which makes it the next block)
                 if (lastBlock.blockNumber != newBlock.blockNumber - 1)
                 {
-                    Console.WriteLine("ERROR: Invalid block number. It has been rejected.");
+                    if(debug)
+                        Console.WriteLine("ERROR: Invalid block number. It has been rejected.");
+
                     return false;
                 }
 
                 // Check to make sure that the last blocks hash matches up with 
                 if (lastBlock.blockHash != newBlock.previousBlockHash)
                 {
-                    Console.WriteLine("ERROR: New block's previous hash does not match last local block's hash. It has been rejected.");
+                    if (debug)
+                        Console.WriteLine("ERROR: New block's previous hash does not match last local block's hash. It has been rejected.");
+
                     return false;
                 }
 
                 if (newBlock.blockHash != CalculateBlockHash(newBlock))
                 {
-                    Console.WriteLine("ERROR: New block's hash does not match the data stored within it. It has been rejected.");
+                    if (debug)
+                        Console.WriteLine("ERROR: New block's hash does not match the data stored within it. It has been rejected.");
+
                     return false;
                 }
 
@@ -313,13 +350,17 @@ namespace XiCoin
                 // If variance > 60 seconds the block is invalid.
                 if(newBlock.timestamp - lastBlock.timestamp < -60)
                 {
-                    Console.WriteLine("ERROR: New block's timestamp is below the allowed 60 seconds variance. It has been rejected.");
+                    if (debug)
+                        Console.WriteLine("ERROR: New block's timestamp is below the allowed 60 seconds variance. It has been rejected.");
+
                     return false;
                 }
 
                 if (Utility.UTCEpocTime() - newBlock.timestamp < -60)
                 {
-                    Console.WriteLine("ERROR: New block's timestamp is above the allowed 60 seconds variance. It has been rejected.");
+                    if (debug)
+                        Console.WriteLine("ERROR: New block's timestamp is above the allowed 60 seconds variance. It has been rejected.");
+
                     return false;
                 }
 
@@ -334,22 +375,31 @@ namespace XiCoin
             public static string CalculateBlockHash(Block targetBlock)
             {
                 // TODO: Add wallets and data in here
-                return Utility.EncryptString(targetBlock.blockNumber.ToString() + targetBlock.timestamp + targetBlock.previousBlockHash.ToString());
+                return Utility.HashString(targetBlock.blockNumber + targetBlock.timestamp + targetBlock.previousBlockHash);
             }
 
             /// <summary>
-            /// Checks if the new blockchain provided is valid or not, by finding whether it is longer than the current blockchain or not. (will change this to largest total difficulty soon)
-            /// If it is equal - the race is on! The longer chain always takes the priority.
+            /// Checks if the new blockchain provided is valid or not, by finding whichever blockchain took the most computation power. This is 
             /// </summary>
             /// <param name="localBlockchain"> The local blockchain </param>
             /// <param name="newBlockchain"> The external blockchain to test </param>
             /// <returns></returns>
-            public static bool ValidateBlockchain(List<Block> localBlockchain, List<Block> newBlockchain)
+            public static bool ValidateBlockchain(ConcurrentDictionary<long, Block> localBlockchain, ConcurrentDictionary<long, Block> newBlockchain)
             {
-                if (localBlockchain.Count < newBlockchain.Count)
+                long localDifficulty = 0;
+                long newDifficulty = 0;
+
+                foreach(Block block in localBlockchain.Values)
+                    localDifficulty += block.difficulty ^ 4;
+
+                foreach (Block block in newBlockchain.Values)
+                    newDifficulty += block.difficulty ^ 4;
+
+                if (localDifficulty < newDifficulty)
                     return true;
-                else
-                    return false;
+
+                // If we make it this far, the local blockchain was seen as more difficult.
+                return false;
             }
 
             /// <summary>
@@ -358,9 +408,9 @@ namespace XiCoin
             /// <param name="blockchain"></param>
             /// <param name="difficultyAdjustmentInterval"></param>
             /// <returns></returns>
-            public static long GetDifficulty(List<Block> blockchain)
+            public static long GetDifficulty(ConcurrentDictionary<long, Block> blockchain)
             {
-                Block lastBlock = blockchain[blockchain.Count - 1];
+                Block lastBlock = blockchain.Last().Value;
 
                 // We check to see if it's not the first block, and if it's not, we see if it's time for the difficulty to be updated (determined by difficultyAdjustmentInterval
                 if(lastBlock.blockNumber % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && lastBlock.blockNumber != 0)
@@ -376,7 +426,7 @@ namespace XiCoin
             /// <param name="difficultyAdjustmentInterval"></param>
             /// <param name="blockGenerationInterval"></param>
             /// <returns></returns>
-            public static long CalculateNewDifficulty(List<Block> blockchain)
+            public static long CalculateNewDifficulty(ConcurrentDictionary<long, Block> blockchain)
             {
                 Block lastBlock = blockchain[blockchain.Count - 1];
                 Block lastAdjustedBlock = blockchain[blockchain.Count - DIFFICULTY_ADJUSTMENT_INTERVAL];
@@ -413,7 +463,7 @@ namespace XiCoin
             public static bool DoesHashMatchDifficulty(string hash, long difficulty)
             {
                 string requiredPrefix = "";
-                string binaryHash = Utility.ByteToBinary(Utility.StringToByteArray(hash, Encoding.ASCII));
+                string binaryHash = Utility.ByteToBinary(Utility.StringToByteArray(hash, Encoding.UTF8));
 
                 // We quickly need to iterate through 
                 int i = 0;
@@ -434,7 +484,7 @@ namespace XiCoin
     /// 
     /// </summary>
     [Serializable]
-    class Peer
+    public class Peer
     {
         public string ipAddress;
         public List<Peer> peers;
@@ -444,7 +494,7 @@ namespace XiCoin
     /// 
     /// </summary>
     [Serializable]
-    struct Block
+    public struct Block
     {
         /// <summary> The current blocks index (starts from 0, builds up) </summary>
         public long blockNumber;
@@ -474,7 +524,7 @@ namespace XiCoin
     /// Contains all of the public information for a wallet.
     /// </summary>
     [Serializable]
-    struct Wallet
+    public struct Wallet
     {
         /// <summary> The value in the wallet </summary>
         public float value;
@@ -491,7 +541,7 @@ namespace XiCoin
     /// 
     /// </summary>
     [Serializable]
-    struct Transaction
+    public struct Transaction
     {
         /// <summary> Value of the transaction </summary>
         public float value;
@@ -515,15 +565,29 @@ namespace XiCoin
         /// </summary>
         /// <param name="stringToEncrypt">String to be encrypted</param>
         /// <returns>Encryped string in form of byte list</returns>
-        public static string EncryptString(string stringToEncrypt = "")
+        public static string HashString(string stringToEncrypt = "")
         {
-            if (stringToEncrypt == "")
-                stringToEncrypt = GetRandomString();
-
-            using (SHA256 sha256 = new SHA256Managed())
+            using (SHA512 sha512 = new SHA512Managed())
             {
-                return sha256.ComputeHash(Encoding.UTF8.GetBytes(stringToEncrypt)).ToString();
+                return GetStringFromHash(sha512.ComputeHash(StringToByteArray(stringToEncrypt, Encoding.UTF8), 0, stringToEncrypt.Length));
             }
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="hash"></param>
+        /// <returns></returns>
+        private static string GetStringFromHash(byte[] hash)
+        {
+            StringBuilder result = new StringBuilder();
+
+            for (int i = 0; i < hash.Length; i++)
+            {
+                result.Append(hash[i].ToString("X2"));
+            }
+
+            return result.ToString();
         }
 
         /// <summary>

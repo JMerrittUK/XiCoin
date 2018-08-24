@@ -82,6 +82,7 @@
     </Compile>
     <Compile Include="XiCoin.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="XiMiner.cs" />
     <Compile Include="XiWallet.cs">
       <SubType>UserControl</SubType>
     </Compile>
