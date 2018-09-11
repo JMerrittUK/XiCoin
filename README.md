@@ -9,6 +9,7 @@ to make improvements, you should do it on the main branch on GitHub, to help imp
 Made an improvement or wallet you're particularly proud of? 
 Drop me an email at work@jmerritt.uk!
 
+Contributors:
 - Jared Merritt
 http://jmerritt.uk/
 
