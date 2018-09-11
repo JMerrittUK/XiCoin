@@ -9,6 +9,9 @@ to make improvements, you should do it on the main branch on GitHub, to help imp
 Made an improvement or wallet you're particularly proud of? 
 Drop me an email at work@jmerritt.uk!
 
+- Jared Merritt
+http://jmerritt.uk/
+
 ## Legal
 This work is licensed under a Creative Commons Attribution 4.0 International License: https://creativecommons.org/licenses/by/4.0/
 Basically you can do what you want with it, so long as you reference the original GitHub page prominently throughout your codebase / application.
